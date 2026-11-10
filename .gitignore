@@ -1,0 +1,7 @@
+# NOTE (Kiroween rule): /.kiro MUST NOT be gitignored — it proves Kiro usage.
+# Only local/OS noise is ignored here.
+.DS_Store
+node_modules/
+dist/
+*.log
+.env

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dead Pool Detector — Is the pool alive or dead?</title>
+<meta name="description" content="Read-only on-chain checker for BSC tokens: real pair reserves and a simulated sell, not the displayed price. Verdicts: ALIVE / RISKY / DEAD / LYING_DISPLAY / NO_MARKET.">
+<style>
+  :root{
+    --bg:#0d0a14; --panel:#171126; --panel2:#1f1836; --ink:#ece7f7; --dim:#a99fc4;
+    --accent:#ff7a1a; --accent2:#9d6bff; --line:#322a52;
+    --alive:#2ecc71; --risky:#f1c40f; --dead:#e74c3c; --lying:#e67e22; --nomarket:#95a5a6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);line-height:1.55}
+  a{color:var(--accent2)}
+  .wrap{max-width:920px;margin:0 auto;padding:0 20px 64px}
+  header{padding:56px 0 8px;text-align:center}
+  .ghost{font-size:44px}
+  h1{margin:6px 0 4px;font-size:40px;letter-spacing:.5px}
+  .tagline{font-size:19px;color:var(--accent);font-style:italic;margin:0 0 10px}
+  .sub{color:var(--dim);max-width:640px;margin:0 auto}
+  .badge{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 12px;font-size:13px;color:var(--dim);margin-top:14px}
+  section{margin-top:44px}
+  h2{font-size:24px;border-bottom:2px solid var(--line);padding-bottom:6px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card h3{margin:0 0 6px;font-size:16px;color:var(--accent)}
+  .card p{margin:0;color:var(--dim);font-size:14px}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  th,td{padding:10px 12px;text-align:left;font-size:14px;border-bottom:1px solid var(--line);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  .v{font-weight:700;white-space:nowrap}
+  .v-alive{color:var(--alive)} .v-risky{color:var(--risky)} .v-dead{color:var(--dead)}
+  .v-lying{color:var(--lying)} .v-nomarket{color:var(--nomarket)}
+  .sample-banner{background:#3a2408;border:1px solid var(--accent);color:#ffd9ae;border-radius:8px;
+    padding:10px 14px;font-size:14px;font-weight:600;text-align:center;margin-bottom:14px}
+  .report{background:var(--panel2);border:1px dashed var(--accent);border-radius:10px;padding:18px}
+  .report .row{display:flex;justify-content:space-between;gap:16px;padding:5px 0;border-bottom:1px solid var(--line);font-size:14px}
+  .report .row:last-child{border-bottom:none}
+  .report .k{color:var(--dim)} .report .val{font-family:ui-monospace,Menlo,Consolas,monospace;text-align:right}
+  .verdict-big{display:inline-block;font-size:20px;font-weight:800;padding:4px 16px;border-radius:8px;margin:8px 0 4px}
+  .vb-alive{background:#0f3520;color:var(--alive)} .vb-risky{background:#38300a;color:var(--risky)}
+  .vb-dead{background:#3d130d;color:#ff8a7a} .vb-lying{background:#3a2408;color:var(--lying)}
+  .vb-nomarket{background:#23282b;color:var(--nomarket)}
+  label{font-size:14px;color:var(--dim)}
+  select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:14px;margin:6px 0 14px;width:100%}
+  pre{background:#08060e;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5}
+  code{font-family:ui-monospace,Menlo,Consolas,monospace}
+  .note{color:var(--dim);font-size:13px}
+  footer{margin-top:56px;border-top:1px solid var(--line);padding-top:16px;color:var(--dim);font-size:13px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="ghost">👻</div>
+  <h1>Dead Pool Detector</h1>
+  <p class="tagline">"The price is a rumor. The sell simulation is the truth."</p>
+  <p class="sub">Paste a BSC token contract address into the CLI and get a verdict:
+     is the pool actually alive — or is the displayed price a ghost?</p>
+  <span class="badge">Kiroween 2026 · Category: Frankenstein · Read-only · No wallet · No keys</span>
+</header>
+
+<section>
+  <h2>What it checks</h2>
+  <div class="cards">
+    <div class="card"><h3>1 · Token basics</h3>
+      <p>Reads <code>totalSupply</code>, <code>decimals</code> and <code>symbol</code> straight from the token contract.</p></div>
+    <div class="card"><h3>2 · Pair resolution</h3>
+      <p>Asks the PancakeSwap V2 factory for the token/WBNB pair (<code>getPair</code>). No pair means there is nothing to sell into.</p></div>
+    <div class="card"><h3>3 · Real reserves</h3>
+      <p>Reads the pair's actual reserves (<code>getReserves</code>) — the money that is really there, not a number a website displays.</p></div>
+    <div class="card"><h3>4 · Sell simulation</h3>
+      <p>Simulates selling a reference amount through the router (<code>getAmountsOut</code>) and compares it with the spot value implied by the reserves. The result is the <strong>exit ratio</strong>.</p></div>
+    <div class="card"><h3>5 · Display cross-check (optional)</h3>
+      <p>Give it the liquidity figure a site displays and the BNB price, and it estimates real liquidity as 2 × quote reserve × quote price — then compares.</p></div>
+    <div class="card"><h3>Read-only by design</h3>
+      <p>Every check is an <code>eth_call</code>. The tool never signs, never transacts, and never asks for a wallet or a key.</p></div>
+  </div>
+  <p class="note">On the build-phase roadmap: PancakeSwap V3 pair probing (<code>liquidity()</code> / <code>slot0</code>),
+     on-chain sell-tax reads, and owner-power / hidden-mint checks. The verdict engine you see below is the shipped core.</p>
+</section>
+
+<section>
+  <h2>The verdicts</h2>
+  <table>
+    <tr><th>Verdict</th><th>Meaning</th></tr>
+    <tr><td class="v v-alive">ALIVE</td><td>Reserves are real and the simulated sell exits near spot.</td></tr>
+    <tr><td class="v v-risky">RISKY</td><td>The pool lives, but the exit leaks value (exit ratio below 0.80 — tax or price impact), or the sell route cannot be simulated.</td></tr>
+    <tr><td class="v v-dead">DEAD</td><td>Reserves are zero or dust (under 0.001 WBNB) while supply exists, or a simulated sell returns almost nothing (exit ratio under 0.01).</td></tr>
+    <tr><td class="v v-lying">LYING_DISPLAY</td><td>Real reserves are under 1% of the liquidity figure being displayed. The price on screen is a costume on an empty pool.</td></tr>
+    <tr><td class="v v-nomarket">NO_MARKET</td><td>No pair against WBNB on the main factory — there is no exit at all.</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>Sample report</h2>
+  <div class="sample-banner">⚠ SAMPLE REPORT — FICTIONAL TOKEN, ILLUSTRATIVE NUMBERS ONLY. NOT A REAL TOKEN, NOT REAL ON-CHAIN DATA.</div>
+  <label for="scenario">Pick a sample scenario:</label>
+  <select id="scenario">
+    <option value="dead">Sample A — the ghost pool (displayed price, empty pool)</option>
+    <option value="alive">Sample B — a healthy pool</option>
+    <option value="lying">Sample C — the lying display</option>
+    <option value="nomarket">Sample D — no market at all</option>
+  </select>
+  <div class="report" id="report"><!-- rendered by JS from sample data --></div>
+  <p class="note">These four scenarios mirror the detector's real unit-test cases. Run the CLI below to produce a report from live chain data.</p>
+</section>
+
+<section>
+  <h2>Use the CLI</h2>
+  <p>The analysis core is <code>detector.py</code> — pure Python standard library, zero dependencies.</p>
+  <pre><code># Basic check (BSC, PancakeSwap V2):
+python3 detector.py --chain bsc --token 0x&lt;token-address&gt;
+
+# Cross-check a liquidity figure a website displays:
+python3 detector.py --chain bsc --token 0x&lt;token-address&gt; \
+                    --displayed-usd 13540 --quote-usd 880
+
+# Options:
+#   --pair &lt;address&gt;     use this pair instead of factory lookup
+#   --sell-amount N      reference sell amount in token units
+#                        (default: 1% of supply, capped at 10% of the
+#                         pool's token reserve)
+#   --rpc &lt;url&gt;          override the RPC endpoint
+#   --json               JSON output only
+
+# Run the test suite (mocked RPC, no network):
+python3 -m unittest discover -s tests -v</code></pre>
+</section>
+
+<section>
+  <h2>Why this exists</h2>
+  <p>Vetting free-mint and token offers by hand taught one expensive lesson: a displayed price is not
+     proof. A token page can advertise five figures of "liquidity" while the pool contract holds nothing
+     and a simulated full sell returns a fraction of a cent. Dead Pool Detector stitches the checks that
+     catch that — pair, reserves, simulated exit, displayed-figure cross-check — into one verdict.
+     A Frankenstein of a vetting pipeline, a price chart, and a lie detector.</p>
+</section>
+
+<footer>
+  Dead Pool Detector · MIT License · Built for Kiroween 2026 (Frankenstein) ·
+  All checks are read-only <code>eth_call</code>s against public BSC RPC endpoints.
+</footer>
+
+</div>
+
+<script>
+// SAMPLE DATA ONLY — fictional tokens, illustrative numbers. No network calls are made by this page.
+var SCENARIOS = {
+  dead: {
+    token: "GHOST (fictional sample)", address: "0x000…SAMPLE-A", supply: "1,000,000,000",
+    pair: "found (V2, vs WBNB)", reserves: "1,000,000,000 GHOST / 0.0000 WBNB",
+    displayed: "$13,540 (sample site figure)", real: "≈ $0",
+    sell: "simulated sell returns ≈ 0 WBNB", ratio: "0.000",
+    verdict: "DEAD", cls: "vb-dead v-dead",
+    reason: "Supply exists but quote reserves are zero — there is no exit, whatever the chart says."
+  },
+  alive: {
+    token: "HEALTHY (fictional sample)", address: "0x000…SAMPLE-B", supply: "100,000,000",
+    pair: "found (V2, vs WBNB)", reserves: "5,300,000 HEALTHY / 14,100 WBNB",
+    displayed: "—", real: "consistent with reserves",
+    sell: "simulated sell exits near spot", ratio: "0.93",
+    verdict: "ALIVE", cls: "vb-alive v-alive",
+    reason: "Real reserves on both sides and the simulated sell keeps 93% of spot value."
+  },
+  lying: {
+    token: "COSTUME (fictional sample)", address: "0x000…SAMPLE-C", supply: "500,000,000",
+    pair: "found (V2, vs WBNB)", reserves: "480,000,000 COSTUME / 0.2 WBNB",
+    displayed: "$120,000 (sample site figure)", real: "≈ $350 (2 × quote reserve × BNB price)",
+    sell: "simulated sell returns a sliver of spot", ratio: "0.004",
+    verdict: "LYING_DISPLAY", cls: "vb-lying v-lying",
+    reason: "Real liquidity is ~0.3% of the displayed figure — under the 1% line. The display is a costume."
+  },
+  nomarket: {
+    token: "ORPHAN (fictional sample)", address: "0x000…SAMPLE-D", supply: "10,000,000",
+    pair: "none (factory.getPair returned the zero address)", reserves: "—",
+    displayed: "—", real: "—",
+    sell: "impossible — no pair to sell into", ratio: "—",
+    verdict: "NO_MARKET", cls: "vb-nomarket v-nomarket",
+    reason: "No WBNB pair on the main factory. Whatever the token is worth on paper, there is no market."
+  }
+};
+function render(key){
+  var s = SCENARIOS[key];
+  var rows = [
+    ["Token", s.token], ["Address", s.address], ["Total supply", s.supply],
+    ["Pair", s.pair], ["Reserves", s.reserves],
+    ["Displayed liquidity", s.displayed], ["Real liquidity est.", s.real],
+    ["Sell simulation", s.sell], ["Exit ratio", s.ratio]
+  ];
+  var html = rows.map(function(r){
+    return '<div class="row"><span class="k">' + r[0] + '</span><span class="val">' + r[1] + '</span></div>';
+  }).join("");
+  html += '<div><span class="verdict-big ' + s.cls + '">' + s.verdict + '</span></div>';
+  html += '<p class="note" style="margin:4px 0 0">' + s.reason + '</p>';
+  document.getElementById("report").innerHTML = html;
+}
+document.getElementById("scenario").addEventListener("change", function(){ render(this.value); });
+render("dead");
+</script>
+</body>
+</html>

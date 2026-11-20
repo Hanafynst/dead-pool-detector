@@ -11,6 +11,28 @@
 
 No backend. No database. No auth. Static hosting (Vercel / GitHub Pages).
 
+## As built (2026-11-20) — deviations from the draft above
+
+- **No ethers.js, no CDN.** The browser engine is hand-rolled (4-byte
+  selectors + 32-byte words, BigInt uint256) inside the single
+  `frontend/index.html` — zero external dependencies, no build step. The
+  repo's zero-dependency rule (already true of detector.py) won over the
+  draft's CDN plan.
+- **One file, not modules.** `chain.js` / `verdict.js` / `labels.js` live as
+  delimited blocks in index.html: a DOM-free engine block (transport
+  injected, exercised headlessly by tests/live_port_check.mjs) plus a thin
+  UI glue block. `blacklist.js` is not built yet (task 6 open).
+- **The Python core is the reference implementation.** The browser engine is
+  a 1:1 port of detector.py — same call order, same thresholds (dust
+  0.001 WBNB, exit < 0.01 DEAD, exit < 0.80 RISKY, real < 1% of displayed
+  LYING_DISPLAY). Where the draft above and detector.py disagreed (e.g.
+  RISKY at sim < 50%), detector.py's shipped thresholds govern.
+- **DexScreener not used.** The displayed-liquidity cross-check takes the
+  figure (and BNB price) as optional user inputs, exactly like the CLI
+  flags — no third-party API in the page.
+- **RPC order:** dataseed → publicnode in the browser (PORT-SPEC); the
+  Python core keeps dataseed → defibit → ninicoin.
+
 ## Modules
 
 - `ui/` — single-page UI: address input, balance input, verdict card, signal list.

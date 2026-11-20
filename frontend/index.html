@@ -45,6 +45,14 @@
   .vb-nomarket{background:#23282b;color:var(--nomarket)}
   label{font-size:14px;color:var(--dim)}
   select{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:14px;margin:6px 0 14px;width:100%}
+  input[type=text]{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:14px;width:100%;margin:6px 0 10px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 14px}
+  .btn{background:var(--accent);color:#171126;border:none;border-radius:8px;padding:10px 22px;font-size:15px;font-weight:700;cursor:pointer}
+  .btn:disabled{opacity:.55;cursor:wait}
+  .status{font-size:14px;color:var(--dim);min-height:22px;margin:12px 0 8px}
+  .status.err{color:#ff8a7a}
+  .report.live{border-style:solid}
+  .flag{color:#ffd9ae;font-size:13px;margin:3px 0}
   pre{background:#08060e;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.5}
   code{font-family:ui-monospace,Menlo,Consolas,monospace}
   .note{color:var(--dim);font-size:13px}
@@ -58,7 +66,7 @@
   <div class="ghost">👻</div>
   <h1>Dead Pool Detector</h1>
   <p class="tagline">"The price is a rumor. The sell simulation is the truth."</p>
-  <p class="sub">Paste a BSC token contract address into the CLI and get a verdict:
+  <p class="sub">Paste a BSC token contract address into the live check below (or the CLI) and get a verdict:
      is the pool actually alive — or is the displayed price a ghost?</p>
   <span class="badge">Kiroween 2026 · Category: Frankenstein · Read-only · No wallet · No keys</span>
 </header>
@@ -96,6 +104,29 @@
 </section>
 
 <section>
+  <h2>Live check</h2>
+  <p>The same checks as the CLI, run live against BSC mainnet from your browser:
+     token basics, pair lookup, real reserves, and a simulated sell through the router.</p>
+  <label for="live-address">BSC token contract address</label>
+  <input type="text" id="live-address" placeholder="0x…" spellcheck="false" autocomplete="off">
+  <div class="live-grid">
+    <div>
+      <label for="live-displayed">Displayed liquidity in USD (optional)</label>
+      <input type="text" id="live-displayed" inputmode="decimal" placeholder="e.g. 13540">
+    </div>
+    <div>
+      <label for="live-bnb">BNB price in USD (optional, for the display cross-check)</label>
+      <input type="text" id="live-bnb" inputmode="decimal" placeholder="e.g. 880">
+    </div>
+  </div>
+  <button class="btn" id="live-run">Run live check</button>
+  <p class="note">Read-only by design: this page only makes <code>eth_call</code> requests to public BSC RPC
+     endpoints. No wallet connect, no signing, no keys — nothing is ever sent on-chain.</p>
+  <div class="status" id="live-status"></div>
+  <div class="report live" id="live-report" style="display:none"></div>
+</section>
+
+<section>
   <h2>Sample report</h2>
   <div class="sample-banner">⚠ SAMPLE REPORT — FICTIONAL TOKEN, ILLUSTRATIVE NUMBERS ONLY. NOT A REAL TOKEN, NOT REAL ON-CHAIN DATA.</div>
   <label for="scenario">Pick a sample scenario:</label>
@@ -106,7 +137,7 @@
     <option value="nomarket">Sample D — no market at all</option>
   </select>
   <div class="report" id="report"><!-- rendered by JS from sample data --></div>
-  <p class="note">These four scenarios mirror the detector's real unit-test cases. Run the CLI below to produce a report from live chain data.</p>
+  <p class="note">These four scenarios mirror the detector's real unit-test cases. Use the live check above (or the CLI below) to produce a report from live chain data.</p>
 </section>
 
 <section>
@@ -200,6 +231,326 @@ function render(key){
 }
 document.getElementById("scenario").addEventListener("change", function(){ render(this.value); });
 render("dead");
+</script>
+
+<script id="live-engine">
+// Dead Pool Detector — browser live-RPC engine.
+// A 1:1 port of detector.py: same calls, same order, same verdict thresholds.
+// Pure logic, no DOM: the transport (fetch) is injected, so this exact code is
+// exercised headlessly by tests/live_port_check.mjs. All uint256 money math is
+// BigInt; floats appear only where detector.py itself uses them (the USD
+// display cross-check and the dust comparison).
+var DeadPool = (function () {
+  "use strict";
+
+  var FACTORY = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"; // PancakeSwap V2
+  var ROUTER  = "0x10ED43C718714eb63d5aA57B78B54704E256024E"; // PancakeSwap V2
+  var WBNB    = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
+  var ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+  // Fallback order per PORT-SPEC: dataseed first, publicnode second; the
+  // transport falls through on any failure (including browser CORS refusals),
+  // which is what verifies CORS support at runtime.
+  var RPCS = ["https://bsc-dataseed.binance.org", "https://bsc.publicnode.com"];
+  var SEL = {
+    totalSupply: "18160ddd", decimals: "313ce567", symbol: "95d89b41",
+    getPair: "e6a43905", getReserves: "0902f1ac", token0: "0dfe1681",
+    getAmountsOut: "d06ca61f"
+  };
+  var DUST_QUOTE = 0.001; // WBNB — verbatim from detector.py (dust_quote)
+
+  // ---- hand-rolled ABI codec (address / uint256 / address[]) -------------
+  function encAddress(a) { return a.toLowerCase().replace(/^0x/, "").padStart(64, "0"); }
+  function encUint(v) { return v.toString(16).padStart(64, "0"); }
+  function encCall(sel) {
+    var s = "0x" + sel;
+    for (var i = 1; i < arguments.length; i++) s += arguments[i];
+    return s;
+  }
+  function encGetAmountsOut(amountIn, path) {
+    var head = encUint(amountIn) + encUint(64n); // offset to the array data
+    var body = encUint(BigInt(path.length)) + path.map(encAddress).join("");
+    return "0x" + SEL.getAmountsOut + head + body;
+  }
+  function strip(h) { return h.replace(/^0x/, ""); }
+  function decUint(h, word) {
+    var s = strip(h).substr((word || 0) * 64, 64);
+    return s ? BigInt("0x" + s) : 0n;
+  }
+  function decAddress(h, word) {
+    return "0x" + strip(h).substr((word || 0) * 64 + 24, 40);
+  }
+  function decUintArray(h) {
+    var s = strip(h);
+    var base = Number(BigInt("0x" + s.substr(0, 64))) * 2; // byte offset -> hex chars
+    var n = Number(BigInt("0x" + s.substr(base, 64)));
+    var out = [];
+    for (var i = 0; i < n; i++) out.push(BigInt("0x" + s.substr(base + 64 + i * 64, 64)));
+    return out;
+  }
+  function hexToUtf8(hex) {
+    var bytes = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return new TextDecoder("utf-8").decode(bytes).replace(/\u0000/g, "");
+  }
+  function decString(h) {
+    var s = strip(h);
+    if (s.length < 128) { // bytes32-style symbol (some tokens return a fixed bytes32)
+      return hexToUtf8(s.substr(0, 64).replace(/(00)+$/, ""));
+    }
+    var base = Number(BigInt("0x" + s.substr(0, 64))) * 2;
+    var n = Number(BigInt("0x" + s.substr(base, 64)));
+    return hexToUtf8(s.substr(base + 64, n * 2));
+  }
+
+  // ---- display formatting (BigInt in, grouped decimal string out) --------
+  function fmtUnits(raw, decimals, frac) {
+    var neg = raw < 0n; if (neg) raw = -raw;
+    var base = 10n ** BigInt(decimals);
+    var whole = raw / base, rem = raw % base;
+    var fs;
+    if (frac >= decimals) {
+      fs = rem.toString().padStart(decimals, "0").padEnd(frac, "0");
+    } else {
+      var div = 10n ** BigInt(decimals - frac);
+      var q = rem / div, r = rem % div;
+      if (r * 2n >= div) q += 1n; // round half up, like Python's format
+      if (q >= 10n ** BigInt(frac)) { whole += 1n; q = 0n; }
+      fs = q.toString().padStart(frac, "0");
+    }
+    var w = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return (neg ? "-" : "") + w + (frac > 0 ? "." + fs : "");
+  }
+  function fmtMoney(x) {
+    return x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function ratioToFloat(num, den) { // exact BigInt rational -> float
+    if (den === 0n) return 0;
+    return Number((num * 1000000n) / den) / 1000000;
+  }
+
+  // ---- JSON-RPC transport with endpoint fallback --------------------------
+  function RpcError(msg) { this.name = "RpcError"; this.message = msg; }
+  function CallError(msg) { this.name = "CallError"; this.message = msg; }
+  function makeRpc(urls, fetchImpl) {
+    var id = 0, answeredBy = null;
+    async function ethCall(to, data) {
+      var lastErr = null;
+      for (var i = 0; i < urls.length; i++) {
+        id++;
+        var resp;
+        try {
+          resp = await fetchImpl(urls[i], {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: id, method: "eth_call",
+                                   params: [{ to: to, data: data }, "latest"] })
+          });
+        } catch (e) { lastErr = e; continue; } // network/CORS failure: next endpoint
+        if (!resp.ok) { lastErr = new Error("HTTP " + resp.status); continue; }
+        var body = await resp.json();
+        if (body.error) throw new CallError("RPC error: " + JSON.stringify(body.error));
+        answeredBy = urls[i];
+        return body.result;
+      }
+      throw new RpcError("all RPC endpoints failed: " + (lastErr ? lastErr.message : "unknown"));
+    }
+    return { ethCall: ethCall, answeredBy: function () { return answeredBy; } };
+  }
+
+  // ---- the detector (mirrors Detector.analyze in detector.py) -------------
+  async function analyze(rpc, token, opts) {
+    opts = opts || {};
+    token = token.toLowerCase();
+    var out = { token: token, checks: [], flags: [], rows: [] };
+    function row(k, v) { out.rows.push([k, v]); }
+
+    // token basics
+    var supply, decimals, symbol;
+    try {
+      supply = decUint(await rpc.ethCall(token, encCall(SEL.totalSupply)));
+      decimals = Number(decUint(await rpc.ethCall(token, encCall(SEL.decimals))));
+    } catch (e) {
+      if (e && e.name === "RpcError") throw e; // transport down: not a verdict
+      out.verdict = "NO_MARKET";
+      out.flags.push("token contract unreadable: " + e.message);
+      out.summary = "Token contract does not answer basic ERC20 calls.";
+      row("Token", token);
+      return out;
+    }
+    try { symbol = decString(await rpc.ethCall(token, encCall(SEL.symbol))); }
+    catch (e) { symbol = "?"; }
+    out.symbol = symbol; out.decimals = decimals;
+    out.checks.push("totalSupply = " + fmtUnits(supply, decimals, 4) + " " + symbol);
+    row("Token", symbol); row("Address", token);
+    row("Total supply", fmtUnits(supply, decimals, 4) + " " + symbol);
+
+    // pair resolution
+    var pair = decAddress(await rpc.ethCall(FACTORY,
+      encCall(SEL.getPair, encAddress(token), encAddress(WBNB)))).toLowerCase();
+    if (pair === ZERO_ADDRESS) {
+      out.verdict = "NO_MARKET";
+      out.flags.push("no pair against the quote asset on the main DEX factory");
+      out.summary = "No " + symbol + "/WBNB pair exists — there is no market to sell into.";
+      row("Pair", "none (factory returned the zero address)");
+      return out;
+    }
+    out.pair = pair;
+    out.checks.push("pair = " + pair);
+    row("Pair", pair);
+
+    // real reserves, split by token0
+    var resHex = await rpc.ethCall(pair, encCall(SEL.getReserves));
+    var r0 = decUint(resHex, 0), r1 = decUint(resHex, 1);
+    var token0 = decAddress(await rpc.ethCall(pair, encCall(SEL.token0))).toLowerCase();
+    var reserveTokenRaw = token0 === token ? r0 : r1;
+    var reserveQuoteRaw = token0 === token ? r1 : r0;
+    var reserveQuote = Number(reserveQuoteRaw) / 1e18; // WBNB has 18 decimals
+    out.checks.push("reserves = " + fmtUnits(reserveTokenRaw, decimals, 4) + " " + symbol +
+                    " / " + fmtUnits(reserveQuoteRaw, 18, 6) + " WBNB");
+    row("Reserves", fmtUnits(reserveTokenRaw, decimals, 4) + " " + symbol +
+                    " / " + fmtUnits(reserveQuoteRaw, 18, 6) + " WBNB");
+
+    // DEAD rule: reserves zero/dust while supply exists (threshold verbatim)
+    var dead = reserveQuoteRaw === 0n || reserveTokenRaw === 0n || reserveQuote < DUST_QUOTE;
+    if (dead) {
+      out.verdict = "DEAD";
+      out.flags.push("quote reserve is " + fmtUnits(reserveQuoteRaw, 18, 6) +
+        " WBNB (dust threshold 0.001) while total supply is " + fmtUnits(supply, decimals, 2));
+      out.summary = "Pool is dead: reserves are zero/dust, so there is effectively nothing to sell into.";
+      return out;
+    }
+
+    // sell simulation: 1% of supply, capped at 10% of the pool's token reserve
+    var sellRaw = supply / 100n;
+    var cap = reserveTokenRaw / 10n; if (cap < 1n) cap = 1n;
+    if (sellRaw > cap) sellRaw = cap;
+    var simOutRaw = null, exitRatio = null;
+    try {
+      var amounts = decUintArray(await rpc.ethCall(ROUTER,
+        encGetAmountsOut(sellRaw, [token, WBNB])));
+      simOutRaw = amounts[amounts.length - 1];
+      // exit ratio = sim out / spot out, spot out = sell * reserveQuote / reserveToken
+      exitRatio = ratioToFloat(simOutRaw * reserveTokenRaw, sellRaw * reserveQuoteRaw);
+      var spotRaw = (sellRaw * reserveQuoteRaw) / reserveTokenRaw;
+      out.checks.push("sell simulation: " + fmtUnits(sellRaw, decimals, 4) + " " + symbol +
+        " -> " + fmtUnits(simOutRaw, 18, 6) + " WBNB (spot-implied " +
+        fmtUnits(spotRaw, 18, 6) + "; exit ratio " + exitRatio.toFixed(3) + ")");
+      row("Sell simulation", fmtUnits(sellRaw, decimals, 4) + " " + symbol +
+        " -> " + fmtUnits(simOutRaw, 18, 6) + " WBNB");
+      row("Exit ratio", exitRatio.toFixed(3));
+    } catch (e) {
+      out.flags.push("sell simulation reverted/failed: " + e.message);
+      row("Sell simulation", "could not be simulated");
+    }
+    out.exitRatio = exitRatio;
+
+    // display cross-check (optional inputs, same rule as the CLI flags)
+    var lying = false;
+    if (opts.displayedUsd != null && opts.quoteUsd) {
+      var realLiq = 2 * reserveQuote * opts.quoteUsd;
+      out.realLiquidityUsdEst = realLiq;
+      out.checks.push("real liquidity est. $" + fmtMoney(realLiq) +
+                      " vs displayed $" + fmtMoney(opts.displayedUsd));
+      row("Displayed liquidity", "$" + fmtMoney(opts.displayedUsd) + " (your figure)");
+      row("Real liquidity est.", "$" + fmtMoney(realLiq));
+      if (realLiq < 0.01 * opts.displayedUsd) {
+        lying = true;
+        out.flags.push("displayed liquidity $" + fmtMoney(opts.displayedUsd) +
+          " but real reserves imply ~$" + fmtMoney(realLiq) + " (<1% of the claim)");
+      }
+    }
+
+    // verdict (thresholds verbatim from detector.py: 0.01 / 0.80 / 1%)
+    if (lying) {
+      out.verdict = "LYING_DISPLAY";
+      out.summary = "The displayed liquidity is a lie: real reserves are under 1% of the displayed figure.";
+    } else if (exitRatio !== null && exitRatio < 0.01) {
+      out.verdict = "DEAD";
+      out.flags.push("sell simulation returns " + exitRatio.toFixed(4) +
+                     " of spot value — exit is worthless");
+      out.summary = "A full sell simulation returns ~nothing: exit is dead.";
+    } else if (exitRatio !== null && exitRatio < 0.8) {
+      out.verdict = "RISKY";
+      out.flags.push("sell simulation keeps only " + exitRatio.toFixed(2) +
+                     " of spot value (tax and/or price impact)");
+      out.summary = "Pool is alive but the exit leaks value (tax/impact).";
+    } else if (simOutRaw === null) {
+      out.verdict = "RISKY";
+      out.summary = "Reserves exist but the sell route could not be simulated.";
+    } else {
+      out.verdict = "ALIVE";
+      out.summary = "Reserves are real and the simulated sell exits near spot.";
+    }
+    return out;
+  }
+
+  return { analyze: analyze, makeRpc: makeRpc, RPCS: RPCS, RpcError: RpcError,
+           FACTORY: FACTORY, ROUTER: ROUTER, WBNB: WBNB,
+           codec: { encAddress: encAddress, encUint: encUint, encCall: encCall,
+                    encGetAmountsOut: encGetAmountsOut, decUint: decUint,
+                    decAddress: decAddress, decUintArray: decUintArray,
+                    decString: decString },
+           fmtUnits: fmtUnits };
+})();
+</script>
+
+<script>
+// Live check — UI glue. Sample mode above is untouched and stays the default view.
+(function () {
+  var btn = document.getElementById("live-run");
+  var status = document.getElementById("live-status");
+  var box = document.getElementById("live-report");
+  var VB = { ALIVE: "vb-alive", RISKY: "vb-risky", DEAD: "vb-dead",
+             LYING_DISPLAY: "vb-lying", NO_MARKET: "vb-nomarket" };
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function parseUsd(id) {
+    var v = document.getElementById(id).value.trim().replace(/[$,]/g, "");
+    if (!v) return null;
+    var n = Number(v);
+    return isFinite(n) && n > 0 ? n : "invalid";
+  }
+  btn.addEventListener("click", async function () {
+    var addr = document.getElementById("live-address").value.trim().toLowerCase();
+    status.className = "status"; box.style.display = "none";
+    if (!/^0x[0-9a-f]{40}$/.test(addr)) {
+      status.className = "status err";
+      status.textContent = "That doesn't look like a BSC address — it should be 0x followed by 40 hex characters.";
+      return;
+    }
+    var displayed = parseUsd("live-displayed"), bnb = parseUsd("live-bnb");
+    if (displayed === "invalid" || bnb === "invalid") {
+      status.className = "status err";
+      status.textContent = "The optional USD figures need to be plain numbers (or left empty).";
+      return;
+    }
+    btn.disabled = true;
+    status.textContent = "Reading the chain — token, pair, reserves, sell simulation…";
+    var rpc = DeadPool.makeRpc(DeadPool.RPCS, function (u, o) { return fetch(u, o); });
+    try {
+      var out = await DeadPool.analyze(rpc, addr, { displayedUsd: displayed, quoteUsd: bnb });
+      var html = out.rows.map(function (r) {
+        return '<div class="row"><span class="k">' + esc(r[0]) + '</span><span class="val">' +
+               esc(r[1]) + "</span></div>";
+      }).join("");
+      html += '<div><span class="verdict-big ' + VB[out.verdict] + '">' + out.verdict + "</span></div>";
+      html += '<p class="note" style="margin:4px 0 0">' + esc(out.summary) + "</p>";
+      out.flags.forEach(function (f) { html += '<p class="flag">⚠ ' + esc(f) + "</p>"; });
+      box.innerHTML = html;
+      box.style.display = "block";
+      var host = rpc.answeredBy() ? rpc.answeredBy().replace("https://", "") : "—";
+      status.textContent = "Done — answered by " + host + " (read-only eth_call).";
+    } catch (e) {
+      status.className = "status err";
+      status.textContent = e && e.name === "RpcError"
+        ? "RPC didn't answer — try again in a moment."
+        : "The check failed partway (" + (e ? e.message : "unknown error") + ") — try again.";
+    } finally {
+      btn.disabled = false;
+    }
+  });
+})();
 </script>
 </body>
 </html>
